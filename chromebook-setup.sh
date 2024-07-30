@@ -11,6 +11,7 @@
 #  - https://community.arm.com/arm-community-blogs/b/graphics-gaming-and-vr-blog/posts/linux-on-chromebook-with-arm-mali-gpu
 #
 # shellcheck disable=SC2317  # Don't warn about unreachable commands in this file
+# shellcheck disable=SC2086  # Double quote to prevent globbing and word splitting
 
 # Exit on error. Append "|| true" if you expect an error.
 set -e
@@ -312,10 +313,14 @@ jopt()
 }
 
 ensure_command() {
-    # ensure_command foo foo-package
-    which "$1" 2>/dev/null 1>/dev/null ||
+    # ensure_command foo foo-package-fedora [ foo-package-debian ]
     which "$1" 2>/dev/null 1>/dev/null || (
-        echo "Install required command $1 from package $2, e.g. sudo $pkg_mgr install $2"
+        if grep -qi fedora /etc/os-release; then
+            package="$2"
+        else
+            package="${3:-2}"
+        fi
+        echo "Install required command $1 from package $package, e.g. sudo $pkg_mgr install $package"
         exit 1
     )
 }
@@ -328,7 +333,7 @@ find_partitions_by_id()
 {
     unset CB_SETUP_STORAGE1 CB_SETUP_STORAGE2
 
-    for device in /dev/disk/by-id/*; do
+    for device in /dev/disk/by-diskseq/*; do
         if [ "$(realpath $device)" = $CB_SETUP_STORAGE ]; then
             if echo "$device" | grep -q -- "-part[0-9]*$"; then
                 echo "device $MMC must not be a partition part ($device)" 1>&2
@@ -346,14 +351,14 @@ find_partitions_by_id()
                     CB_SETUP_STORAGE2=$part
                 fi
             done
-	    break
+            break
         fi
     done
 }
 
 wait_for_partitions_to_appear()
 {
-    for device in /dev/disk/by-id/*; do
+    for device in /dev/disk/by-diskseq/*; do
         if [ "$(realpath $device)" = $CB_SETUP_STORAGE ]; then
             if echo "$device" | grep -q -- "-part[0-9]*$"; then
                 echo "device $CB_SETUP_STORAGE must not be a partition part ($device)" 1>&2
@@ -430,8 +435,13 @@ create_fit_image()
                  -d arch/${ARCH}/boot/$kernel ${initrd} $dtbs \
                  kernel.itb
     else
-	echo "TODO: create x86_64 FIT image, now using a raw image"
+        echo "TODO: create x86_64 FIT image, now using a raw image"
     fi
+}
+
+create_tmpdir()
+{
+    rm -rf ./tmpdir && mkdir ./tmpdir
 }
 
 # -----------------------------------------------------------------------------
@@ -484,6 +494,14 @@ cmd_format_storage()
     echo "Done."
 }
 
+find_rootfs()
+{
+    if [ -z "$CB_SETUP_STORAGE2" ]; then
+        find_partitions_by_id
+    fi
+    ROOTFS_DIR="$(findmnt -n -o TARGET --source $CB_SETUP_STORAGE2)"
+}
+
 cmd_mount_rootfs()
 {
     # Skip this command if is not a media device.
@@ -494,7 +512,7 @@ cmd_mount_rootfs()
     echo "Mounting rootfs partition..."
 
     udisksctl mount -b "$CB_SETUP_STORAGE2" > /dev/null 2>&1 || true
-    ROOTFS_DIR="$(findmnt -n -o TARGET --source $CB_SETUP_STORAGE2)"
+    find_rootfs
 
     # Verify that the disk is mounted, otherwise exit
     if [ -z "$ROOTFS_DIR" ]; then exit 1; fi
@@ -564,7 +582,7 @@ cmd_build_kernel()
     cd ${CB_KERNEL_PATH}
 
     # Build kernel + modules + device tree blob
-	make W=1 "$(jopt)"
+    make W=1 "$(jopt)"
 
     create_fit_image
 
@@ -624,7 +642,7 @@ cmd_build_vboot()
             ;;
         *)
             echo "Unsupported vboot architecture"
-	    exit 1
+            exit 1
             ;;
     esac
 
@@ -660,9 +678,9 @@ cmd_deploy_vboot()
     else
         if [ "$ARCH" != "x86_64" ]; then
             cp -av $CB_KERNEL_PATH/kernel.itb "$ROOTFS_DIR/boot"
-	    else
+        else
             echo "WARNING: Not implemented for x86_64."
-	    fi
+        fi
     fi
 
     echo "Done."
@@ -681,9 +699,7 @@ cmd_eject_storage()
     echo "All done."
 }
 
-# -----------------------------------------------------------------------------
-# Experimental: Create Fedora images for Chromebooks
-cmd_setup_fedora_rootfs()
+cmd_mount_fedora_rootfs()
 {
     local loopdev
     local image
@@ -693,10 +709,22 @@ cmd_setup_fedora_rootfs()
     loopdev="$(losetup --show -fP $IMAGE)"
     btrfs="${image/raw/btrfs}"
     dd if="${loopdev}p3" of="/var/tmp/$btrfs" conv=fsync status=progress
-    losetup -D
-    rm -rf ./tmpdir && mkdir ./tmpdir
+    losetup -d "$loopdev"
+    create_tmpdir
     mount "/var/tmp/$btrfs" ./tmpdir
     sleep 3
+}
+
+cmd_umount_fedora_rootfs()
+{
+    umount ./tmpdir
+    rm -rf ./tmpdir
+}
+
+# -----------------------------------------------------------------------------
+# Experimental: Create Fedora images for Chromebooks
+cmd_setup_fedora_rootfs()
+{
     echo "Disable SELINUX"
     sed -i 's/SELINUX=enforcing/SELINUX=permissive/' ./tmpdir/root/etc/selinux/config
 
@@ -719,8 +747,6 @@ cmd_setup_fedora_rootfs()
     # Copy the ROOTFS to media
     echo "copying ROOTFS to partition"
     cp -ar "./tmpdir/root/"* "$ROOTFS_DIR"
-    umount ./tmpdir
-    rm -rf ./tmpdir
 
     echo "Done."
 }
@@ -745,6 +771,8 @@ cmd_setup_fedora_kernel()
 {
     local kernel_version
     local image_path
+    local binfmt_entry
+    local binfmt_chroot
 
     if [ -z "$IMAGE" ]; then
         echo "Error: a Fedora image was not set."
@@ -754,20 +782,33 @@ cmd_setup_fedora_kernel()
     image_path="$(readlink -f $IMAGE)"
 
     # Extract and copy the kernel packages to the rootfs
-    mkdir ./tmpdir && cd ./tmpdir
+    create_tmpdir && pushd ./tmpdir
 
     # Extract kernel and initramfs images if were not provided
     if [ -z "$KERNEL" ] && [ -z "$INITRD" ]; then
         if [ -z "$COPR" ]; then
-            virt-builder --get-kernel "$image_path" -o .
+            LIBGUESTFS_BACKEND=direct virt-builder --get-kernel "$image_path" -o .
         else
-             cmd_setup_copr_fedora_kernel
+            cmd_setup_copr_fedora_kernel
         fi
     fi
 
     kernel_version="$(ls vmlinuz-* | sed -e 's/vmlinuz-//')"
 
+    popd && rm -rf ./tmpdir
+
+    if [ ! -d "$ROOTFS_DIR/lib/modules/$kernel_version" ]; then
+	cmd_mount_fedora_rootfs
+	cp -a ./tmpdir/root/lib/modules/$kernel_version "$ROOTFS_DIR/lib/modules/"
+	cmd_umount_fedora_rootfs
+    fi
+
+    create_tmpdir && pushd ./tmpdir
+
     # Generate modules.dep and map files, so modules autoload on first boot
+    if [ -z "$ROOTFS_DIR" ]; then
+        find_rootfs
+    fi
     depmod -b "$ROOTFS_DIR" "$kernel_version"
 
     # Create a directory tree similar to the kernel source tree so we can reuse some functions
@@ -787,25 +828,36 @@ cmd_setup_fedora_kernel()
     if [ -z "$INITRD" ]; then
         # Generate initramfs for the kernel
         # chroot into qemu-aarch-static to generate initramfs for aarch64
+        ensure_command qemu-aarch64-static qemu-user-static-aarch64 qemu-user-static
+        # shellcheck disable=SC2010
+        binfmt_entry=$(ls /proc/sys/fs/binfmt_misc/ | grep aarch64 | head -1)
+        if [ -z "$binfmt_entry" ]; then
+            echo 'No aarch64 support found in /proc/sys/fs/binfmt_misc/.'
+            echo 'Make sure binfmt-misc support is enabled in kernel and aarch64 emulator package'
+            echo 'is present (e.g. qemu-user-static-aarch64 on Fedora, qemu-user-static on Debian).'
+            exit 1
+        fi
+        binfmt_chroot="$ROOTFS_DIR$(sed -n -e '/^interpreter /s/^interpreter //p' /proc/sys/fs/binfmt_misc/"$binfmt_entry")"
+        mkdir -p "$(dirname $binfmt_chroot)"
+        cp "$(which qemu-aarch64-static)" "$binfmt_chroot"
         mount -t sysfs sysfs "$ROOTFS_DIR/sys"
         mount -t proc proc "$ROOTFS_DIR/proc"
         mount -t tmpfs tmpfs "$ROOTFS_DIR/tmp"
         mount -t devtmpfs devtmpfs "$ROOTFS_DIR/dev"
-        cp "$(which qemu-aarch64-static)" "$ROOTFS_DIR/usr/bin"
-        cat << EOF | chroot "/var$ROOTFS_DIR" qemu-aarch64-static /bin/bash
+        cat << EOF | chroot "/var$ROOTFS_DIR" /bin/bash
+        export PATH=/usr/bin:/usr/sbin
         dracut --force -v --add-drivers "ulpi usb-storage phy-qcom-usb-hs-28nm \
         phy-qcom-usb-ss ocmem dwc3 dwc3-of-simple dwc3-pci ehci-platform xhci-plat-hcd \
         i2c-qcom-geni i2c-qup icc-osm-l3 qcom-spmi-pmic phy-qcom-qmp-combo phy-qcom-qusb2 \
         phy-qcom-usb-hs qcom_aoss qcom-apcs-ipc-mailbox llcc-qcom nvmem_qfprom smem \
         smp2p dwc3-qcom onboard_usb_hub mmc_block sdhci_msm \
         " /boot/initramfs-$kernel_version.img --kver $kernel_version --kmoddir /lib/modules/$kernel_version
-        exit
 EOF
         cp "$ROOTFS_DIR/boot/initramfs-$kernel_version.img" arch/arm64/boot/
     fi
     create_fit_image
 
-    cd - > /dev/null
+    popd
 
     export CB_KERNEL_PATH=./tmpdir
     cmd_build_vboot
@@ -863,7 +915,9 @@ cmd_deploy_fedora()
     cmd_get_fedora_image
     cmd_format_storage
     cmd_mount_rootfs
+    cmd_mount_fedora_rootfs
     cmd_setup_fedora_rootfs
+    cmd_umount_fedora_rootfs
     cmd_setup_fedora_kernel
     cmd_eject_storage
 }
@@ -909,25 +963,26 @@ cmd_deploy_kernel_only()
 
 # Ensure sudo user
 if [ "$(whoami)" != "root" ]; then
-        echo "Error: This script requires 'sudo' privileges in order to write to disk & mount media."
-        exit 1
+    echo "Error: This script requires 'sudo' privileges in order to write to disk & mount media."
+    exit 1
 fi
 
 if grep -qi fedora /etc/os-release; then
-  pkg_mgr="dnf"
+    pkg_mgr="dnf"
 else
-  pkg_mgr="apt"
+    pkg_mgr="apt"
 fi
 
 # These commands are required
+ensure_command which which
 ensure_command bc bc
 ensure_command curl curl
 ensure_command findmnt util-linux
-ensure_command realpath realpath
+ensure_command realpath coreutils
 ensure_command sgdisk gdisk
 ensure_command lz4 lz4
 ensure_command mkfs.ext4 e2fsprogs
-ensure_command mkimage u-boot-tools
+ensure_command mkimage uboot-tools u-boot-tools
 ensure_command udisksctl udisks2
 ensure_command vbutil_kernel vboot-utils
 ensure_command virt-builder guestfs-tools
